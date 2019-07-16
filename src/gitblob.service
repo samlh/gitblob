@@ -1,6 +1,8 @@
 [Service]
 Environment=PORT=8976
 Environment=GIT_ROOT=/var/lib/git
+Environment=RUST_LOG=info
+Environment=RUST_BACKTRACE=full
 ExecStart=/usr/local/bin/gitblob
 
 [Install]

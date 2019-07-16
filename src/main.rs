@@ -5,6 +5,7 @@ extern crate gotham;
 extern crate gotham_derive;
 extern crate headers;
 extern crate hyper;
+#[macro_use]
 extern crate log;
 extern crate mime;
 extern crate serde;
@@ -15,9 +16,10 @@ extern crate serde_json;
 use std::env;
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
+use std::str;
 use std::time::{Duration, SystemTime};
 
-use git2::{Commit, Oid, Repository};
+use git2::{Commit, Index, Oid, Repository, AttrCheckFlags};
 use gotham::router::builder::*;
 use gotham::state::{FromState, State};
 use headers::{
@@ -54,10 +56,7 @@ fn get_commit_path_contents_handler(state: State) -> (State, Response<Body>) {
     let result: Response<Body> = {
         let path_info = PathExtractor::borrow_from(&state);
         let repo_name = &path_info.repo_name;
-        let separator = path_info
-            .parts
-            .iter()
-            .position(|p| *p == ":");
+        let separator = path_info.parts.iter().position(|p| *p == ":");
         match separator {
             Some(separator) => {
                 let (commit, path) = path_info.parts.split_at(separator);
@@ -65,7 +64,10 @@ fn get_commit_path_contents_handler(state: State) -> (State, Response<Body>) {
                 let path = PathBuf::from_iter(&path[1..]);
 
                 let if_none_match = HeaderMap::borrow_from(&state).get(IfNoneMatch::name());
-                let if_modified_since = HeaderMap::borrow_from(&state).typed_get::<IfModifiedSince>();
+                let if_modified_since =
+                    HeaderMap::borrow_from(&state).typed_get::<IfModifiedSince>();
+
+                debug!("repo_name = {:?}, commit = {:?}, path = {:?}, if_none_match = {:?}, if_modified_since = {:?}", repo_name, &commit, &path, if_none_match, if_modified_since);
 
                 match get_commit_path_contents_response(
                     repo_name,
@@ -75,18 +77,16 @@ fn get_commit_path_contents_handler(state: State) -> (State, Response<Body>) {
                     if_modified_since,
                 ) {
                     Ok(response) => response,
-                    Err(err) => {
-                        Response::builder()
-                            .status(StatusCode::NOT_FOUND)
-                            .body(String::from(err.message()).into())
-                            .unwrap()
-                    }
+                    Err(err) => Response::builder()
+                        .status(StatusCode::NOT_FOUND)
+                        .body(String::from(err.message()).into())
+                        .expect("Response::builder"),
                 }
-            },
+            }
             _ => Response::builder()
                 .status(StatusCode::NOT_FOUND)
                 .body(Body::empty())
-                .unwrap()
+                .expect("Response::builder"),
         }
     };
     (state, result)
@@ -99,9 +99,9 @@ fn get_commit_path_contents_response(
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
 ) -> Result<Response<Body>, git2::Error> {
-    let repo = Repository::open(
-        Path::new(&env::var("GIT_ROOT").expect("GIT_ROOT env not found!")).join(repo_name),
-    )?;
+    let repo_path =
+        Path::new(&env::var("GIT_ROOT").expect("GIT_ROOT env not found!")).join(repo_name);
+    let repo = Repository::open(&repo_path)?;
     let (commit, stable, last_modified) = get_commit(&repo, name)?;
     let tree = commit.tree()?;
     let entry = tree.get_path(path)?;
@@ -137,17 +137,43 @@ fn get_commit_path_contents_response(
 
     let response = if is_modified {
         let mime_type = guess_mime_type_opt(path).unwrap_or(mime::TEXT_PLAIN_UTF_8);
+        debug!("mime_type = {:?}", mime_type);
 
-        builder
-            .status(StatusCode::OK)
-            .typed_header(ContentType::from(mime_type))
-            .body(Vec::from(blob.content()).into())
-            .unwrap()
+        let mut index = Index::new().expect("Index::new()");
+        index.read_tree(&tree).expect("read_tree");
+        repo.set_index(&mut index);
+
+        let filter = repo.get_attr(&path, "filter", AttrCheckFlags::INDEX_ONLY | AttrCheckFlags::NO_SYSTEM)?;
+        debug!("filter = {:?}", filter);
+        
+        if filter == Some("lfs") {
+            let mut lines = str::from_utf8(blob.content()).expect("str::from_utf8(blob.content())").lines();
+            assert_eq!(lines.next(), Some("version https://git-lfs.github.com/spec/v1"));
+            let oid_line = lines.next().expect("lines.next()");
+            assert!(oid_line.starts_with("oid sha256:"));
+            let lfs_oid = &oid_line[11..];
+            let lfs_path = format!("/{}/lfs/objects/{}/{}/{}", repo_name, &lfs_oid[0..2], &lfs_oid[2..4], &lfs_oid);
+            debug!("lfs_oid = {:?}, lfs_path = {:?}", lfs_oid, lfs_path);
+
+            builder
+                .status(StatusCode::OK)
+                .typed_header(ContentType::from(mime_type))
+                .header("X-Accel-Redirect", lfs_path)
+                .body(Body::empty())
+                .expect("Response::builder")
+        } else {
+            let contents = Vec::from(blob.content());
+            builder
+                .status(StatusCode::OK)
+                .typed_header(ContentType::from(mime_type))
+                .body(contents.into())
+                .expect("Response::builder")
+        }
     } else {
         builder
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())
-            .unwrap()
+            .expect("Response::builder")
     };
 
     Ok(response)
@@ -161,8 +187,12 @@ fn get_commit<'r>(
     match reference {
         Ok(reference) => {
             let reference = reference.resolve()?;
-            let reference_path = repo.path().join(reference.name().unwrap());
-            let metadata = reference_path.metadata();
+            let reference_name = reference.name().expect("reference.name()");
+            let reference_path = repo.path().join(reference_name);
+            let packed_refs_path = repo.path().join("packed-refs");
+            let metadata = reference_path.metadata().or_else(|_| packed_refs_path.metadata());
+            debug!("name = {:?}, reference = {:?}, reference_path = {:?}, packed_refs_path = {:?}, metadata = {:?}", name, reference_name, reference_path, packed_refs_path, &metadata);
+
             let last_modified = metadata.and_then(|m| m.modified()).ok();
             Ok((reference.peel_to_commit()?, false, last_modified))
         }
