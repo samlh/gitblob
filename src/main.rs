@@ -1,34 +1,59 @@
-extern crate base64;
-extern crate env_logger;
-extern crate gotham;
 #[macro_use]
 extern crate gotham_derive;
-extern crate headers;
-extern crate hyper;
 #[macro_use]
 extern crate log;
-extern crate mime;
-extern crate serde;
 #[macro_use]
 extern crate serde_derive;
-extern crate serde_json;
+#[macro_use]
+extern crate quick_error;
 
-use std::env;
-use std::iter::FromIterator;
-use std::path::{Path, PathBuf};
-use std::str;
-use std::time::{Duration, SystemTime};
+use std::{
+    env,
+    iter::FromIterator,
+    path::{Path, PathBuf},
+    str,
+    time::{Duration, SystemTime},
+};
 
-use git2::{Commit, Index, Oid, Repository, AttrCheckFlags};
-use gotham::router::builder::*;
-use gotham::state::{FromState, State};
+use base64;
+use env_logger;
+use git2::{AttrCheckFlags, Blob, Commit, Index, Oid, Repository};
+use gotham::{
+    self,
+    router::builder::*,
+    state::{FromState, State},
+};
 use headers::{
-    CacheControl, ContentType, Expires, Header, HeaderMapExt, IfModifiedSince, IfNoneMatch,
+    self, CacheControl, ContentType, Expires, Header, HeaderMapExt, IfModifiedSince, IfNoneMatch,
     LastModified,
 };
-use hyper::header::{HeaderMap, HeaderName, HeaderValue};
-use hyper::{Body, Response, StatusCode};
+use http;
+use hyper::{
+    self,
+    header::{HeaderMap, HeaderName, HeaderValue},
+    Body, Response, StatusCode,
+};
+use mime;
 use mime_guess::guess_mime_type_opt;
+
+quick_error! {
+    #[derive(Debug)]
+    pub enum Error {
+        Git2(err: git2::Error) {
+            from()
+            cause(err)
+            description(err.description())
+        }
+        Http(err: http::Error) {
+            from()
+            cause(err)
+            description(err.description())
+        }
+        Other(err: &'static str) {
+            description(err)
+        }
+    }
+}
 
 #[derive(Deserialize, StateData, StaticResponseExtender, Debug)]
 struct PathExtractor {
@@ -53,43 +78,38 @@ fn main() {
 }
 
 fn get_commit_path_contents_handler(state: State) -> (State, Response<Body>) {
-    let result: Response<Body> = {
-        let path_info = PathExtractor::borrow_from(&state);
-        let repo_name = &path_info.repo_name;
-        let separator = path_info.parts.iter().position(|p| *p == ":");
-        match separator {
-            Some(separator) => {
-                let (commit, path) = path_info.parts.split_at(separator);
-                let commit = commit.join("/");
-                let path = PathBuf::from_iter(&path[1..]);
+    let mut error_body = Body::empty();
+    let path_info = PathExtractor::borrow_from(&state);
+    let repo_name = &path_info.repo_name;
+    let separator = path_info.parts.iter().position(|p| *p == ":");
+    if let Some(separator) = separator {
+        let (commit, path) = path_info.parts.split_at(separator);
+        let commit = commit.join("/");
+        let path = PathBuf::from_iter(&path[1..]);
 
-                let if_none_match = HeaderMap::borrow_from(&state).get(IfNoneMatch::name());
-                let if_modified_since =
-                    HeaderMap::borrow_from(&state).typed_get::<IfModifiedSince>();
+        let if_none_match = HeaderMap::borrow_from(&state).get(IfNoneMatch::name());
+        let if_modified_since = HeaderMap::borrow_from(&state).typed_get::<IfModifiedSince>();
 
-                debug!("repo_name = {:?}, commit = {:?}, path = {:?}, if_none_match = {:?}, if_modified_since = {:?}", repo_name, &commit, &path, if_none_match, if_modified_since);
+        debug!("repo_name = {:?}, commit = {:?}, path = {:?}, if_none_match = {:?}, if_modified_since = {:?}", repo_name, &commit, &path, if_none_match, if_modified_since);
 
-                match get_commit_path_contents_response(
-                    repo_name,
-                    &commit,
-                    &path,
-                    if_none_match,
-                    if_modified_since,
-                ) {
-                    Ok(response) => response,
-                    Err(err) => Response::builder()
-                        .status(StatusCode::NOT_FOUND)
-                        .body(String::from(err.message()).into())
-                        .expect("Response::builder"),
-                }
-            }
-            _ => Response::builder()
-                .status(StatusCode::NOT_FOUND)
-                .body(Body::empty())
-                .expect("Response::builder"),
+        match get_commit_path_contents_response(
+            repo_name,
+            &commit,
+            &path,
+            if_none_match,
+            if_modified_since,
+        ) {
+            Ok(response) => return (state, response),
+            Err(err) => error_body = err.to_string().into(),
         }
-    };
-    (state, result)
+    }
+    (
+        state,
+        Response::builder()
+            .status(StatusCode::NOT_FOUND)
+            .body(error_body)
+            .unwrap(),
+    )
 }
 
 fn get_commit_path_contents_response(
@@ -98,17 +118,16 @@ fn get_commit_path_contents_response(
     path: &Path,
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
-) -> Result<Response<Body>, git2::Error> {
+) -> Result<Response<Body>, Error> {
     let repo_path =
-        Path::new(&env::var("GIT_ROOT").expect("GIT_ROOT env not found!")).join(repo_name);
+        Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
+            .join(repo_name);
     let repo = Repository::open(&repo_path)?;
     let (commit, stable, last_modified) = get_commit(&repo, name)?;
     let tree = commit.tree()?;
     let entry = tree.get_path(path)?;
     let object = entry.to_object(&repo)?;
-    let blob = object
-        .as_blob()
-        .ok_or_else(|| git2::Error::from_str("Not a blob"))?;
+    let blob = object.as_blob().ok_or(Error::Other("Not a blob"))?;
 
     let max_age = Duration::from_secs(if stable { 60 * 60 * 24 * 30 } else { 60 * 10 });
 
@@ -135,62 +154,58 @@ fn get_commit_path_contents_response(
         builder.typed_header(LastModified::from(last_modified));
     }
 
-    let response = if is_modified {
-        let mime_type = guess_mime_type_opt(path).unwrap_or(mime::TEXT_PLAIN_UTF_8);
-        debug!("mime_type = {:?}", mime_type);
+    if !is_modified {
+        return Ok(builder
+            .status(StatusCode::NOT_MODIFIED)
+            .body(Body::empty())?);
+    }
 
-        let mut index = Index::new().expect("Index::new()");
-        index.read_tree(&tree).expect("read_tree");
-        repo.set_index(&mut index);
+    let mime_type = guess_mime_type_opt(path).unwrap_or(mime::TEXT_PLAIN_UTF_8);
 
-        let filter = repo.get_attr(&path, "filter", AttrCheckFlags::INDEX_ONLY | AttrCheckFlags::NO_SYSTEM)?;
-        debug!("filter = {:?}", filter);
-        
-        if filter == Some("lfs") {
-            let mut lines = str::from_utf8(blob.content()).expect("str::from_utf8(blob.content())").lines();
-            assert_eq!(lines.next(), Some("version https://git-lfs.github.com/spec/v1"));
-            let oid_line = lines.next().expect("lines.next()");
-            assert!(oid_line.starts_with("oid sha256:"));
-            let lfs_oid = &oid_line[11..];
-            let lfs_path = format!("/{}/lfs/objects/{}/{}/{}", repo_name, &lfs_oid[0..2], &lfs_oid[2..4], &lfs_oid);
-            debug!("lfs_oid = {:?}, lfs_path = {:?}", lfs_oid, lfs_path);
+    let mut index = Index::new()?;
+    index.read_tree(&tree)?;
+    repo.set_index(&mut index);
 
-            builder
+    let filter = repo.get_attr(
+        &path,
+        "filter",
+        AttrCheckFlags::INDEX_ONLY | AttrCheckFlags::NO_SYSTEM,
+    )?;
+    debug!("mime_type = {:?}, filter = {:?}", mime_type, filter);
+
+    if filter == Some("lfs") {
+        if let Some(lfs_path) = get_lfs_cache_path(repo_name, blob) {
+            return Ok(builder
                 .status(StatusCode::OK)
                 .typed_header(ContentType::from(mime_type))
                 .header("X-Accel-Redirect", lfs_path)
-                .body(Body::empty())
-                .expect("Response::builder")
-        } else {
-            let contents = Vec::from(blob.content());
-            builder
-                .status(StatusCode::OK)
-                .typed_header(ContentType::from(mime_type))
-                .body(contents.into())
-                .expect("Response::builder")
+                .body(Body::empty())?);
         }
-    } else {
-        builder
-            .status(StatusCode::NOT_MODIFIED)
-            .body(Body::empty())
-            .expect("Response::builder")
-    };
+    }
 
-    Ok(response)
+    let contents = Vec::from(blob.content());
+    Ok(builder
+        .status(StatusCode::OK)
+        .typed_header(ContentType::from(mime_type))
+        .body(contents.into())?)
 }
 
 fn get_commit<'r>(
     repo: &'r Repository,
     name: &str,
-) -> Result<(Commit<'r>, bool, Option<SystemTime>), git2::Error> {
+) -> Result<(Commit<'r>, bool, Option<SystemTime>), Error> {
     let reference = repo.resolve_reference_from_short_name(name);
     match reference {
         Ok(reference) => {
             let reference = reference.resolve()?;
-            let reference_name = reference.name().expect("reference.name()");
+            let reference_name = reference
+                .name()
+                .ok_or(Error::Other("reference has no name"))?;
             let reference_path = repo.path().join(reference_name);
             let packed_refs_path = repo.path().join("packed-refs");
-            let metadata = reference_path.metadata().or_else(|_| packed_refs_path.metadata());
+            let metadata = reference_path
+                .metadata()
+                .or_else(|_| packed_refs_path.metadata());
             debug!("name = {:?}, reference = {:?}, reference_path = {:?}, packed_refs_path = {:?}, metadata = {:?}", name, reference_name, reference_path, packed_refs_path, &metadata);
 
             let last_modified = metadata.and_then(|m| m.modified()).ok();
@@ -198,6 +213,28 @@ fn get_commit<'r>(
         }
         _ => Ok((repo.find_commit(Oid::from_str(name)?)?, true, None)),
     }
+}
+
+fn get_lfs_cache_path(repo_name: &str, blob: &Blob) -> Option<String> {
+    let mut lines = str::from_utf8(blob.content()).ok()?.lines();
+    let version_line = lines.next()?;
+    if version_line != "version https://git-lfs.github.com/spec/v1" {
+        return None;
+    }
+    let oid_line = lines.next()?;
+    if !oid_line.starts_with("oid sha256:") {
+        return None;
+    }
+    let lfs_oid = &oid_line[11..];
+    let lfs_path = format!(
+        "/{}/lfs/objects/{}/{}/{}",
+        repo_name,
+        &lfs_oid[0..2],
+        &lfs_oid[2..4],
+        &lfs_oid
+    );
+    debug!("lfs_oid = {:?}, lfs_path = {:?}", lfs_oid, lfs_path);
+    Some(lfs_path)
 }
 
 struct HeadersExtender<'a, 'b> {
