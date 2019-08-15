@@ -1,17 +1,21 @@
 #[macro_use]
 extern crate gotham_derive;
 #[macro_use]
+extern crate lazy_static;
+#[macro_use]
 extern crate log;
 #[macro_use]
-extern crate serde_derive;
-#[macro_use]
 extern crate quick_error;
+#[macro_use]
+extern crate serde_derive;
 
 use std::{
+    collections::HashMap,
     env,
     iter::FromIterator,
     path::{Path, PathBuf},
     str,
+    sync::Mutex,
     time::{Duration, SystemTime},
 };
 
@@ -33,8 +37,7 @@ use hyper::{
     header::{HeaderMap, HeaderName, HeaderValue},
     Body, Response, StatusCode,
 };
-use mime;
-use mime_guess::guess_mime_type_opt;
+use mime_guess::from_path;
 
 quick_error! {
     #[derive(Debug)]
@@ -45,6 +48,11 @@ quick_error! {
             description(err.description())
         }
         Http(err: http::Error) {
+            from()
+            cause(err)
+            description(err.description())
+        }
+        Io(err: std::io::Error) {
             from()
             cause(err)
             description(err.description())
@@ -61,6 +69,11 @@ struct PathExtractor {
 
     #[serde(rename = "*")]
     parts: Vec<String>,
+}
+
+lazy_static! {
+    static ref REPO_CACHE: Mutex<HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>> =
+        { Mutex::new(HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>::new()) };
 }
 
 fn main() {
@@ -119,14 +132,63 @@ fn get_commit_path_contents_response(
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
 ) -> Result<Response<Body>, Error> {
-    let repo_path =
-        Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
-            .join(repo_name);
-    let repo = Repository::open(&repo_path)?;
-    let (commit, stable, last_modified) = get_commit(&repo, name)?;
+    let repo_mutex = {
+        let mut repo_cache = REPO_CACHE.lock().unwrap();
+        let repo_mutex = repo_cache
+            .get_mut(repo_name)
+            .and_then(|repo_vec| repo_vec.pop());
+        match repo_mutex {
+            Some(repo_mutex) => repo_mutex,
+            None => {
+                let repo_path =
+                    Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
+                        .join(repo_name);
+                (Repository::open(repo_path)?, None).into()
+            },
+        }
+    };
+
+    let response = {
+        let mut repo_and_last_index = repo_mutex.lock().unwrap();
+        let (ref repo, ref mut last_index) = *repo_and_last_index;
+        get_commit_path_contents_response_for_repo(
+            repo_name,
+            repo,
+            last_index,
+            name,
+            path,
+            if_none_match,
+            if_modified_since,
+        )
+    };
+
+    {
+        let mut repo_cache = REPO_CACHE.lock().unwrap();
+        let repo_vec = repo_cache
+            .entry(repo_name.to_string())
+            .or_insert_with(|| Vec::with_capacity(10));
+        if repo_vec.len() < 10 {
+            repo_vec.push(repo_mutex);
+        }
+    }
+
+    response
+}
+
+fn get_commit_path_contents_response_for_repo(
+    repo_name: &str,
+    repo: &Repository,
+    last_index: &mut Option<Oid>,
+    name: &str,
+    path: &Path,
+    if_none_match: Option<&HeaderValue>,
+    if_modified_since: Option<IfModifiedSince>,
+) -> Result<Response<Body>, Error> {
+    let (commit, stable, last_modified) = get_commit(repo, name)?;
     let tree = commit.tree()?;
+    let tree_id = tree.id();
     let entry = tree.get_path(path)?;
-    let object = entry.to_object(&repo)?;
+    let object = entry.to_object(repo)?;
     let blob = object.as_blob().ok_or(Error::Other("Not a blob"))?;
 
     let max_age = Duration::from_secs(if stable { 60 * 60 * 24 * 30 } else { 60 * 10 });
@@ -160,11 +222,14 @@ fn get_commit_path_contents_response(
             .body(Body::empty())?);
     }
 
-    let mime_type = guess_mime_type_opt(path).unwrap_or(mime::TEXT_PLAIN_UTF_8);
+    let mime_type = from_path(path).first_or_text_plain();
 
-    let mut index = Index::new()?;
-    index.read_tree(&tree)?;
-    repo.set_index(&mut index);
+    if *last_index != Some(tree_id) {
+        let mut index = Index::new()?;
+        index.read_tree(&tree)?;
+        repo.set_index(&mut index);
+        *last_index = Some(tree_id);
+    }
 
     let filter = repo.get_attr(
         &path,

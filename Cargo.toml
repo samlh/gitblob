@@ -7,23 +7,20 @@ edition = "2018"
 [dependencies]
 base64 = "0.10.1"
 env_logger = "0.6.2"
-git2 = "0.9"
-gotham = "0.3.0"
-gotham_derive = "0.3.0"
+git2 = "0.9.2"
+gotham = "0.4.0"
+gotham_derive = "0.4.0"
 headers = "0.2.1"
-http = "0.1.17"  
-hyper = "0.12"
-log = "0.4.7"
-mime = "0.3.13"
-mime_guess = "2.0.0-alpha.6"
+http = "0.1.18"
+hyper = "0.12.33"
+lazy_static = "1.3.0"
+log = "0.4.8"
+mime_guess = "2.0.1"
 quick-error = "1.2.2"
-serde = "1.0.94"
-serde_derive = "1.0.94"
+serde = "1.0.98"
+serde_derive = "1.0.98"
 serde_json = "1.0.40"
 
 [profile.release]
 # debug = true
 lto = 'thin'
-
-[patch.crates-io]
-git2 = { path = "/home/samlh/proj/git2-rs" }
