@@ -23,4 +23,4 @@ serde_json = "1.0.40"
 
 [profile.release]
 # debug = true
-lto = 'thin'
+# lto = 'thin'

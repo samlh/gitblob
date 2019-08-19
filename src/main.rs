@@ -71,6 +71,8 @@ struct PathExtractor {
     parts: Vec<String>,
 }
 
+const NUM_THREADS: usize = 1;
+
 lazy_static! {
     static ref REPO_CACHE: Mutex<HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>> =
         { Mutex::new(HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>::new()) };
@@ -79,7 +81,7 @@ lazy_static! {
 fn main() {
     env_logger::init();
     let port = env::var("PORT").expect("PORT env not found!");
-    gotham::start(
+    gotham::start_with_num_threads(
         format!("127.0.0.1:{}", port),
         build_simple_router(|route| {
             route
@@ -87,6 +89,7 @@ fn main() {
                 .with_path_extractor::<PathExtractor>()
                 .to(get_commit_path_contents_handler)
         }),
+        NUM_THREADS,
     );
 }
 
@@ -132,19 +135,21 @@ fn get_commit_path_contents_response(
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
 ) -> Result<Response<Body>, Error> {
-    let repo_mutex = {
-        let mut repo_cache = REPO_CACHE.lock().unwrap();
-        let repo_mutex = repo_cache
-            .get_mut(repo_name)
-            .and_then(|repo_vec| repo_vec.pop());
-        match repo_mutex {
-            Some(repo_mutex) => repo_mutex,
-            None => {
-                let repo_path =
-                    Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
-                        .join(repo_name);
-                (Repository::open(repo_path)?, None).into()
-            },
+    let repo_mutex = REPO_CACHE
+        .lock()
+        .unwrap()
+        .get_mut(repo_name)
+        .and_then(|repo_vec| {
+            debug!("repo_vec.len = {:?}", repo_vec.len());
+            repo_vec.pop()
+        });
+    let repo_mutex = match repo_mutex {
+        Some(repo_mutex) => repo_mutex,
+        None => {
+            let repo_path =
+                Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
+                    .join(repo_name);
+            (Repository::open(repo_path)?, None).into()
         }
     };
 
@@ -162,14 +167,12 @@ fn get_commit_path_contents_response(
         )
     };
 
-    {
-        let mut repo_cache = REPO_CACHE.lock().unwrap();
-        let repo_vec = repo_cache
-            .entry(repo_name.to_string())
-            .or_insert_with(|| Vec::with_capacity(10));
-        if repo_vec.len() < 10 {
-            repo_vec.push(repo_mutex);
-        }
+    let mut repo_cache = REPO_CACHE.lock().unwrap();
+    let repo_vec = repo_cache
+        .entry(repo_name.to_string())
+        .or_insert_with(|| Vec::with_capacity(NUM_THREADS));
+    if repo_vec.len() <= NUM_THREADS {
+        repo_vec.push(repo_mutex);
     }
 
     response
@@ -225,9 +228,8 @@ fn get_commit_path_contents_response_for_repo(
     let mime_type = from_path(path).first_or_text_plain();
 
     if *last_index != Some(tree_id) {
-        let mut index = Index::new()?;
-        index.read_tree(&tree)?;
-        repo.set_index(&mut index);
+        debug!("tree_id = {:?} last_index = {:?}", tree_id, last_index);
+        repo.index().unwrap().read_tree(&tree).unwrap();
         *last_index = Some(tree_id);
     }
 
