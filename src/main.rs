@@ -1,11 +1,9 @@
 #[macro_use]
 extern crate gotham_derive;
 #[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate log;
-#[macro_use]
 extern crate quick_error;
+#[macro_use]
+extern crate lazy_static;
 #[macro_use]
 extern crate serde_derive;
 
@@ -20,8 +18,7 @@ use std::{
 };
 
 use base64;
-use env_logger;
-use git2::{AttrCheckFlags, Blob, Commit, Index, Oid, Repository};
+use git2::{AttrCheckFlags, Blob, Commit, Oid, Repository};
 use gotham::{
     self,
     router::builder::*,
@@ -31,17 +28,18 @@ use headers::{
     self, CacheControl, ContentType, Expires, Header, HeaderMapExt, IfModifiedSince, IfNoneMatch,
     LastModified,
 };
-use http;
 use hyper::{
     self,
     header::{HeaderMap, HeaderName, HeaderValue},
-    Body, Response, StatusCode,
+    http, Body, Response, StatusCode,
 };
 use mime_guess::from_path;
+use tracing::debug;
+use tracing_subscriber;
 
 quick_error! {
     #[derive(Debug)]
-    pub enum Error {
+    pub enum GitblobError {
         Git2(err: git2::Error) {
             from()
             cause(err)
@@ -79,7 +77,8 @@ lazy_static! {
 }
 
 fn main() {
-    env_logger::init();
+    tracing_subscriber::fmt::init();
+
     let port = env::var("PORT").expect("PORT env not found!");
     gotham::start_with_num_threads(
         format!("127.0.0.1:{}", port),
@@ -134,7 +133,7 @@ fn get_commit_path_contents_response(
     path: &Path,
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
-) -> Result<Response<Body>, Error> {
+) -> Result<Response<Body>, GitblobError> {
     let repo_mutex = REPO_CACHE
         .lock()
         .unwrap()
@@ -146,9 +145,10 @@ fn get_commit_path_contents_response(
     let repo_mutex = match repo_mutex {
         Some(repo_mutex) => repo_mutex,
         None => {
-            let repo_path =
-                Path::new(&env::var("GIT_ROOT").map_err(|_| Error::Other("GIT_ROOT not set!"))?)
-                    .join(repo_name);
+            let repo_path = Path::new(
+                &env::var("GIT_ROOT").map_err(|_| GitblobError::Other("GIT_ROOT not set!"))?,
+            )
+            .join(repo_name);
             (Repository::open(repo_path)?, None).into()
         }
     };
@@ -186,13 +186,13 @@ fn get_commit_path_contents_response_for_repo(
     path: &Path,
     if_none_match: Option<&HeaderValue>,
     if_modified_since: Option<IfModifiedSince>,
-) -> Result<Response<Body>, Error> {
+) -> Result<Response<Body>, GitblobError> {
     let (commit, stable, last_modified) = get_commit(repo, name)?;
     let tree = commit.tree()?;
     let tree_id = tree.id();
     let entry = tree.get_path(path)?;
     let object = entry.to_object(repo)?;
-    let blob = object.as_blob().ok_or(Error::Other("Not a blob"))?;
+    let blob = object.as_blob().ok_or(GitblobError::Other("Not a blob"))?;
 
     let max_age = Duration::from_secs(if stable { 60 * 60 * 24 * 30 } else { 60 * 10 });
 
@@ -260,14 +260,14 @@ fn get_commit_path_contents_response_for_repo(
 fn get_commit<'r>(
     repo: &'r Repository,
     name: &str,
-) -> Result<(Commit<'r>, bool, Option<SystemTime>), Error> {
+) -> Result<(Commit<'r>, bool, Option<SystemTime>), GitblobError> {
     let reference = repo.resolve_reference_from_short_name(name);
     match reference {
         Ok(reference) => {
             let reference = reference.resolve()?;
             let reference_name = reference
                 .name()
-                .ok_or(Error::Other("reference has no name"))?;
+                .ok_or(GitblobError::Other("reference has no name"))?;
             let reference_path = repo.path().join(reference_name);
             let packed_refs_path = repo.path().join("packed-refs");
             let metadata = reference_path
