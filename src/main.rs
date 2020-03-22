@@ -10,6 +10,8 @@ extern crate serde_derive;
 use std::{
     collections::HashMap,
     env,
+    ffi::OsStr,
+    io::prelude::*,
     iter::FromIterator,
     path::{Path, PathBuf},
     str,
@@ -18,6 +20,7 @@ use std::{
 };
 
 use base64;
+use flate2::{write::GzEncoder, Compression};
 use git2::{AttrCheckFlags, Blob, Commit, Oid, Repository};
 use gotham::{
     self,
@@ -190,11 +193,24 @@ fn get_commit_path_contents_response_for_repo(
     let (commit, stable, last_modified) = get_commit(repo, name)?;
     let tree = commit.tree()?;
     let tree_id = tree.id();
-    let entry = tree.get_path(path)?;
-    let object = entry.to_object(repo)?;
+
+    let entry = tree.get_path(path);
+
+    let (object, needs_compression) = match entry {
+        Ok(entry) => (entry.to_object(repo)?, false),
+        Err(err) => match path.extension().and_then(OsStr::to_str) {
+            Some("gz") => {
+                let path = path.with_file_name(path.file_stem().unwrap());
+                let entry = tree.get_path(&path).map_err(|_| err)?;
+                (entry.to_object(repo)?, true)
+            }
+            _ => return Err(err.into()),
+        },
+    };
+
     let blob = object.as_blob().ok_or(GitblobError::Other("Not a blob"))?;
 
-    let max_age = Duration::from_secs(if stable { 60 * 60 * 24 * 30 } else { 60 * 10 });
+    let max_age = Duration::from_secs(if stable { 60 * 60 * 24 * 30 } else { 60 * 60 });
 
     let etag = format!("\"{}\"", base64::encode(blob.id().as_bytes()));
 
@@ -208,6 +224,9 @@ fn get_commit_path_contents_response_for_repo(
         }
         _ => true,
     };
+
+    debug!("repo_name = {:?}, commit = {:?}, path = {:?}, if_none_match = {:?}, if_modified_since = {:?}, needs_compression = {:?}, stable = {:?}, etag = {:?}, is_modified = {:?}, last_modified = {:?}", 
+        repo_name, &commit, &path, if_none_match, if_modified_since, needs_compression, stable, etag, is_modified, last_modified);
 
     let mut builder = Response::builder();
     builder
@@ -223,6 +242,16 @@ fn get_commit_path_contents_response_for_repo(
         return Ok(builder
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())?);
+    }
+
+    if needs_compression {
+        let mut e = GzEncoder::new(Vec::new(), Compression::default());
+        e.write_all(blob.content())?;
+        let contents = e.finish()?;
+        return Ok(builder
+            .status(StatusCode::OK)
+            .typed_header(ContentType::octet_stream())
+            .body(contents.into())?);
     }
 
     let mime_type = from_path(path).first_or_text_plain();
@@ -273,9 +302,10 @@ fn get_commit<'r>(
             let metadata = reference_path
                 .metadata()
                 .or_else(|_| packed_refs_path.metadata());
-            debug!("name = {:?}, reference = {:?}, reference_path = {:?}, packed_refs_path = {:?}, metadata = {:?}", name, reference_name, reference_path, packed_refs_path, &metadata);
-
             let last_modified = metadata.and_then(|m| m.modified()).ok();
+
+            debug!("name = {:?}, reference = {:?}, reference_path = {:?}, packed_refs_path = {:?}, last_modified = {:?}", name, reference_name, reference_path, packed_refs_path, last_modified);
+
             Ok((reference.peel_to_commit()?, false, last_modified))
         }
         _ => Ok((repo.find_commit(Oid::from_str(name)?)?, true, None)),
