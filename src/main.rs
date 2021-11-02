@@ -45,21 +45,18 @@ quick_error! {
     pub enum GitblobError {
         Git2(err: git2::Error) {
             from()
-            cause(err)
-            description(err.description())
+            source(err)
         }
         Http(err: http::Error) {
             from()
-            cause(err)
-            description(err.description())
+            source(err)
         }
         Io(err: std::io::Error) {
             from()
-            cause(err)
-            description(err.description())
+            source(err)
         }
         Other(err: &'static str) {
-            description(err)
+            display("{}", err)
         }
     }
 }
@@ -76,7 +73,7 @@ const NUM_THREADS: usize = 1;
 
 lazy_static! {
     static ref REPO_CACHE: Mutex<HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>> =
-        { Mutex::new(HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>::new()) };
+        Mutex::new(HashMap::<String, Vec<Mutex<(Repository, Option<Oid>)>>>::new());
 }
 
 fn main() {
@@ -228,14 +225,13 @@ fn get_commit_path_contents_response_for_repo(
     debug!("repo_name = {:?}, commit = {:?}, path = {:?}, if_none_match = {:?}, if_modified_since = {:?}, needs_compression = {:?}, stable = {:?}, etag = {:?}, is_modified = {:?}, last_modified = {:?}", 
         repo_name, &commit, &path, if_none_match, if_modified_since, needs_compression, stable, etag, is_modified, last_modified);
 
-    let mut builder = Response::builder();
-    builder
+    let mut builder = Response::builder()
         .header(headers::ETag::name(), etag)
         .typed_header(CacheControl::new().with_max_age(max_age).with_public())
         .typed_header(Expires::from(SystemTime::now() + max_age));
 
     if let Some(last_modified) = last_modified {
-        builder.typed_header(LastModified::from(last_modified));
+        builder = builder.typed_header(LastModified::from(last_modified));
     }
 
     if !is_modified {
@@ -334,30 +330,32 @@ fn get_lfs_cache_path(repo_name: &str, blob: &Blob) -> Option<String> {
     Some(lfs_path)
 }
 
-struct HeadersExtender<'a, 'b> {
-    builder: &'a mut hyper::http::response::Builder,
-    name: &'b HeaderName,
+struct HeadersExtender {
+    builder: hyper::http::response::Builder,
+    name: &'static HeaderName,
 }
 
-impl<'a, 'b> Extend<HeaderValue> for HeadersExtender<'a, 'b> {
+impl Extend<HeaderValue> for HeadersExtender {
     fn extend<I: IntoIterator<Item = HeaderValue>>(&mut self, iter: I) {
+        let mut builder = std::mem::replace(&mut self.builder, hyper::http::response::Builder::new());
         for v in iter.into_iter() {
-            self.builder.header(self.name, v);
+            builder = builder.header(self.name, v);
         }
+        self.builder = builder;
     }
 }
 
 pub trait ResponseBuilderExt {
-    fn typed_header<H: Header>(&mut self, header: H) -> &mut hyper::http::response::Builder;
+    fn typed_header<H: Header>(self, header: H) -> hyper::http::response::Builder;
 }
 
 impl ResponseBuilderExt for hyper::http::response::Builder {
-    fn typed_header<H: Header>(&mut self, header: H) -> &mut hyper::http::response::Builder {
+    fn typed_header<H: Header>(self, header: H) -> hyper::http::response::Builder {
         let mut extender = HeadersExtender {
             builder: self,
             name: H::name(),
         };
         header.encode(&mut extender);
-        self
+        extender.builder
     }
 }
